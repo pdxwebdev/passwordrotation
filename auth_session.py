@@ -91,7 +91,7 @@ def validate_site(site: str) -> Optional[str]:
 
 def validate_action(action: str) -> Optional[str]:
     a = (action or "").strip().lower()
-    if a in ("signin", "register", "status", "operator"):
+    if a in ("signin", "register", "status", "operator", "client", "storage"):
         return a
     return None
 
@@ -265,6 +265,12 @@ def public_session_view(doc: dict, *, include_secrets: bool = False) -> dict:
                 out["token"] = result.get("token")
             if result.get("operator_session"):
                 out["operator_session"] = True
+            if result.get("baseAddress"):
+                out["baseAddress"] = result.get("baseAddress")
+            if result.get("identity"):
+                out["identity"] = result.get("identity")
+            if result.get("siaBox"):
+                out["siaBox"] = result.get("siaBox")
     if include_secrets:
         out["result_token"] = doc.get("result_token")
     return out
@@ -346,6 +352,7 @@ def push_payload_from_session(doc: dict) -> dict:
         "expires_at": doc.get("expires_at"),
         "home_node": doc.get("home_node") or None,
         "bind_id": doc.get("bind_id") or None,
+        "boxPub": doc.get("box_pub") or None,
     }
 
 

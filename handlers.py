@@ -699,7 +699,7 @@ class PasswordAuthSessionCreateHandler(BaseHandler):
             return self.render_as_json(
                 {
                     "status": False,
-                    "message": "action must be signin, register, status, or operator",
+                    "message": "action must be signin, register, status, operator, client, or storage",
                 }
             )
 
@@ -727,6 +727,7 @@ class PasswordAuthSessionCreateHandler(BaseHandler):
         if not forward:
             bind_id = await asess.issue_signin_bind(self, username_signature)
         # Operator unlock binds to *this* node's treasury — never proxy away.
+        # client is a visitor handoff and must not take that path.
         if action == "operator":
             site = asess.normalize_site(this_base) or this_base
             mismatch = await vault_matches_node(self, inception_pkh)
@@ -754,6 +755,7 @@ class PasswordAuthSessionCreateHandler(BaseHandler):
                     "expectedHash": expected_hash or None,
                     "nonce": nonce,
                     "bind_id": bind_id,
+                    "boxPub": (body.get("boxPub") or body.get("box_pub") or "").strip() or None,
                     "_forwarded": True,
                 }
                 req = HTTPRequest(
@@ -831,6 +833,7 @@ class PasswordAuthSessionCreateHandler(BaseHandler):
             "expires_date": asess.expires_date_from_ts(expires_at),
             "home_node": home_url or this_base,
             "bind_id": bind_id,
+            "box_pub": (body.get("boxPub") or body.get("box_pub") or "").strip(),
             "result": None,
             "delivered_at": None,
         }
@@ -948,6 +951,41 @@ class PasswordAuthSessionResultHandler(BaseHandler):
             result["nextPasswordHash"] = body.get("nextPasswordHash") or body.get(
                 "next_password_hash"
             )
+        if ok and action == "storage":
+            sia_box = (body.get("siaBox") or body.get("sia_box") or "").strip()
+            if not sia_box:
+                status = "denied"
+                result = {
+                    "ok": False,
+                    "action": "storage",
+                    "nonce": doc.get("nonce"),
+                    "message": "storage key was not returned",
+                }
+            else:
+                result["siaBox"] = sia_box
+                result["message"] = result.get("message") or "storage key returned"
+                result.pop("token", None)
+                result.pop("operator_session", None)
+
+        if ok and action == "client":
+            address = (body.get("baseAddress") or body.get("base_address") or "").strip()
+            identity = (body.get("identity") or "").strip()
+            if not address or not identity:
+                status = "denied"
+                result = {
+                    "ok": False,
+                    "action": "client",
+                    "nonce": doc.get("nonce"),
+                    "message": "client identity incomplete",
+                }
+            else:
+                result["baseAddress"] = address
+                result["identity"] = identity
+                result["username"] = doc.get("username")
+                result["message"] = result.get("message") or "client identity returned"
+                result.pop("token", None)
+                result.pop("operator_session", None)
+
         if ok and action == "signin":
             verified, why = await _verify_sealed_signin(
                 self, doc, body.get("password_enc") or ""
