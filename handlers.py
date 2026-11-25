@@ -786,6 +786,13 @@ class PasswordAuthSessionCreateHandler(BaseHandler):
                     data.setdefault(
                         "sp_username_signature", route.get("sp_username_signature")
                     )
+                    # The RP read token is distinct from the authenticator result
+                    # token. Only this token can read the approved result.
+                    rp_token = (data.get("rp_token") or "").strip()
+                    data.pop("result_token", None)
+                    if not rp_token:
+                        raise ValueError("home did not issue an rp_token")
+                    data["rp_token"] = rp_token
                     # Remember the remote session so same-origin polls can proxy it.
                     # The browser often cannot read the home directly (CORS).
                     try:
@@ -798,6 +805,9 @@ class PasswordAuthSessionCreateHandler(BaseHandler):
                                 "status": "proxied",
                                 "proxied": True,
                                 "home_node": home_url,
+                                "bind_id": bind_id,
+                                "rp_token": rp_token,
+                                "verification_code": data.get("verification_code"),
                                 "expires_at": asess._now() + asess.SESSION_TTL_SEC,
                                 "result": None,
                             }
@@ -816,6 +826,8 @@ class PasswordAuthSessionCreateHandler(BaseHandler):
         expires_at = now + asess.SESSION_TTL_SEC
         session_id = asess.new_session_id()
         result_token = asess.new_result_token()
+        rp_token = asess.new_rp_token()
+        verification_code = asess.new_verification_code()
         doc = {
             "session_id": session_id,
             "username": username,
@@ -827,6 +839,8 @@ class PasswordAuthSessionCreateHandler(BaseHandler):
             "nonce": nonce,
             "expected_hash": expected_hash,
             "result_token": result_token,
+            "rp_token": rp_token,
+            "verification_code": verification_code,
             "status": "pending",
             "created_at": now,
             "expires_at": expires_at,
@@ -845,6 +859,8 @@ class PasswordAuthSessionCreateHandler(BaseHandler):
 
         view = asess.public_session_view(doc)
         view["poll_url"] = f"/password-rotation/auth-session/{session_id}"
+        view["rp_token"] = rp_token
+        view["verification_code"] = verification_code
         view["source"] = route.get("source") or "deterministic"
         view["sp_username_signature"] = route.get("sp_username_signature")
         if delivered:
@@ -859,36 +875,50 @@ class PasswordAuthSessionCreateHandler(BaseHandler):
 
 
 class PasswordAuthSessionGetHandler(BaseHandler):
-    """GET /password-rotation/auth-session/{id} — RP poll."""
+    """GET /password-rotation/auth-session/{id} — RP poll.
+
+    Requires the session's ``rp_token`` (header ``X-Password-Auth-RP-Token``
+    or ``rp_token`` query). Only the RP browser that created the session holds
+    it; the authenticator's ``result_token`` cannot read the result.
+    """
 
     async def get(self, session_id):
         from plugins.passwordrotation import auth_session as asess
 
+        token = (
+            self.get_query_argument("rp_token", "")
+            or self.request.headers.get("X-Password-Auth-RP-Token")
+            or ""
+        ).strip()
         doc = await asess.get_session(session_id)
-        if doc and doc.get("proxied") and doc.get("home_node"):
+        if not doc or not asess.verify_rp_token(doc, token):
+            self.set_status(404)
+            return self.render_as_json(
+                {"status": False, "message": "session not found"}
+            )
+        if doc.get("proxied") and doc.get("home_node"):
             remote = await asess.fetch_remote_session_view(
-                doc.get("home_node") or "", session_id
+                doc.get("home_node") or "", session_id, token
             )
             if remote:
                 remote["proxied"] = True
                 remote["home_node"] = doc.get("home_node")
                 return self.render_as_json(remote)
-        if not doc:
-            self.set_status(404)
-            return self.render_as_json(
-                {"status": False, "message": "session not found"}
-            )
         if float(doc.get("expires_at") or 0) < asess._now():
             if doc.get("status") not in ("approved", "denied", "expired"):
                 await asess.update_session(session_id, {"status": "expired"})
                 doc["status"] = "expired"
-        view = asess.public_session_view(doc)
-        # After RP has read an approved result once, optionally scrub secrets
-        if doc.get("status") == "approved" and not doc.get("result_consumed"):
-            await asess.update_session(session_id, {"result_consumed": True})
-        elif doc.get("status") == "approved" and doc.get("result_consumed"):
-            view.pop("password", None)
-            view.pop("token", None)
+        if doc.get("status") == "approved":
+            # One-time claim: only the first reader receives token/password.
+            claimed = await asess.claim_session_result(session_id)
+            if claimed is not None:
+                view = asess.public_session_view(claimed)
+            else:
+                view = asess.public_session_view(doc)
+                view.pop("password", None)
+                view.pop("token", None)
+        else:
+            view = asess.public_session_view(doc)
         return self.render_as_json(view)
 
 
@@ -926,13 +956,61 @@ class PasswordAuthSessionResultHandler(BaseHandler):
                 {"status": False, "message": "invalid result token"}
             )
 
+        # Operator approvals must come from the browser that created the
+        # request. The bind cookie is HttpOnly and per-browser, so a different
+        # browser's authenticator cannot approve someone else's request.
+        if (doc.get("action") or "").strip().lower() == "operator":
+            bind = await asess.peek_signin_bind(self)
+            if bind is not None and (bind.get("bind_id") or "") != (
+                doc.get("bind_id") or ""
+            ):
+                self.set_status(403)
+                return self.render_as_json(
+                    {
+                        "status": False,
+                        "message": "approval did not come from the requesting browser",
+                    }
+                )
+
         if doc.get("status") in ("approved", "denied"):
-            return self.render_as_json(asess.public_session_view(doc))
+            done = asess.public_session_view(doc)
+            done.pop("token", None)
+            return self.render_as_json(done)
 
         deny = body.get("denied") is True or body.get("deny") is True
         ok = bool(body.get("ok")) and not deny
         status = "approved" if ok else "denied"
         action = (body.get("action") or doc.get("action") or "").strip().lower()
+
+        # Prove the approver is looking at the requesting browser. Either the
+        # extension in that same browser/tab presents the session's rp_token
+        # (only that browser received it), or the user types the code shown on
+        # the requesting page into Yada Password on any device.
+        if ok and action in ("operator", "signin", "register"):
+            same_browser = (
+                body.get("rp_token")
+                or body.get("rpToken")
+                or self.request.headers.get("X-Password-Auth-RP-Token")
+                or ""
+            )
+            if not asess.verify_rp_token(doc, same_browser):
+                code = (
+                    body.get("verification_code")
+                    or body.get("verificationCode")
+                    or body.get("code")
+                    or ""
+                )
+                if not asess.verify_verification_code(doc, code):
+                    self.set_status(403)
+                    return self.render_as_json(
+                        {
+                            "status": False,
+                            "message": (
+                                "verification code did not match the requesting "
+                                "browser"
+                            ),
+                        }
+                    )
 
         result = {
             "ok": ok,
@@ -1085,36 +1163,78 @@ class PasswordAuthSessionResultHandler(BaseHandler):
                     }
 
         updated = await asess.mark_result(session_id, result, status)
-        return self.render_as_json(asess.public_session_view(updated or doc))
+        done = asess.public_session_view(updated or doc)
+        # The authenticator does not need the one-time RP token; only the
+        # session's creator may read it via the token-gated GET endpoint.
+        done.pop("token", None)
+        return self.render_as_json(done)
 
 
 class PasswordAuthSessionPendingHandler(BaseHandler):
     """GET /password-rotation/auth-session/pending — drain queue for authenticator.
 
-    Query: username, username_signature, public_key (or inception_pkh).
+    The caller must prove it controls the identity key: ``username``,
+    ``timestamp`` and ``signature`` over ``password-auth-pending|username|ts``.
+    Without this an attacker could enumerate another user's sessions and steal
+    their ``result_token``.
     """
 
     async def get(self):
         from plugins.passwordrotation import auth_session as asess
 
         username = (self.get_argument("username", "") or "").strip()
-        username_signature = (self.get_argument("username_signature", "") or "").strip()
-        public_key = (self.get_argument("public_key", "") or "").strip()
-        inception_pkh = (self.get_argument("inception_pkh", "") or "").strip()
-        if not inception_pkh and public_key:
-            try:
-                inception_pkh = asess._pkh_from_pubhex(public_key)
-            except Exception:
-                inception_pkh = ""
-
-        if not (username or username_signature or inception_pkh):
-            self.set_status(400)
+        timestamp_raw = (self.get_argument("timestamp", "") or "").strip()
+        signature = (self.get_argument("signature", "") or "").strip()
+        if not username or not timestamp_raw or not signature:
+            self.set_status(401)
             return self.render_as_json(
                 {
                     "status": False,
-                    "message": "username, username_signature, or inception_pkh required",
+                    "message": "signed identity proof required",
                 }
             )
+        try:
+            timestamp = int(timestamp_raw)
+        except (TypeError, ValueError):
+            self.set_status(400)
+            return self.render_as_json(
+                {"status": False, "message": "invalid timestamp"}
+            )
+        if abs(asess._now() - timestamp) > asess.PENDING_AUTH_WINDOW_SEC:
+            self.set_status(401)
+            return self.render_as_json(
+                {"status": False, "message": "timestamp out of range"}
+            )
+
+        identity = await asess.resolve_identity(username)
+        if not identity:
+            self.set_status(404)
+            return self.render_as_json(
+                {"status": False, "message": f"username '{username}' not found"}
+            )
+        public_key = (identity.get("public_key") or "").strip()
+        if not public_key or not asess.verify_identity_signature(
+            public_key=public_key,
+            message=asess.pending_auth_message(username, timestamp),
+            signature_b64=signature,
+        ):
+            self.set_status(401)
+            return self.render_as_json(
+                {"status": False, "message": "invalid identity signature"}
+            )
+        if not asess.consume_auth_proof(signature):
+            self.set_status(401)
+            return self.render_as_json(
+                {"status": False, "message": "proof already used"}
+            )
+
+        id_fields = identity.get("identity") or {}
+        username_signature = id_fields.get("username_signature") or ""
+        inception_pkh = ""
+        try:
+            inception_pkh = asess._pkh_from_pubhex(public_key)
+        except Exception:
+            inception_pkh = ""
 
         rows = await asess.list_pending_for_identity(
             inception_pkh=inception_pkh,

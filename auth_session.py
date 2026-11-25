@@ -9,6 +9,7 @@ The RP polls until approved/denied/expired.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import json
 import re
@@ -30,6 +31,7 @@ HOME_COLLECTION = "password_auth_homes"
 BIND_COLLECTION = "password_signin_binds"
 SIGNIN_BIND_COOKIE = "yada_signin_bind"
 SESSION_TTL_SEC = 300
+PENDING_AUTH_WINDOW_SEC = 300
 HOME_TTL_SEC = 86400 * 30
 RATE_WINDOW_SEC = 60
 RATE_MAX_PER_USER = 12
@@ -172,6 +174,24 @@ def new_result_token() -> str:
     return secrets.token_urlsafe(32)
 
 
+def new_rp_token() -> str:
+    """Read capability for the RP browser; distinct from the result token."""
+    return secrets.token_urlsafe(32)
+
+
+def new_verification_code() -> str:
+    """Short code shown in the requesting browser and typed into Yada Password."""
+    return f"{secrets.randbelow(1_000_000):06d}"
+
+
+def verify_verification_code(doc: dict, code: str) -> bool:
+    expected = str(doc.get("verification_code") or "").strip()
+    got = str(code or "").strip()
+    if not expected or not got:
+        return False
+    return hmac.compare_digest(expected, got)
+
+
 def new_nonce() -> str:
     return f"n_{int(_now() * 1000)}_{secrets.token_hex(4)}"
 
@@ -276,8 +296,15 @@ def public_session_view(doc: dict, *, include_secrets: bool = False) -> dict:
     return out
 
 
-async def fetch_remote_session_view(home_base: str, session_id: str) -> Optional[dict]:
-    """GET a public auth-session view from the home that actually stores it."""
+async def fetch_remote_session_view(
+    home_base: str, session_id: str, rp_token: str = ""
+) -> Optional[dict]:
+    """GET a public auth-session view from the home that actually stores it.
+
+    ``rp_token`` proves the caller created the session; the home refuses
+    reads without it so a leaked session id (or authenticator result token)
+    cannot be used to steal the approved operator token.
+    """
     from tornado.httpclient import AsyncHTTPClient, HTTPRequest
 
     base = normalize_http_base(home_base or "")
@@ -287,10 +314,13 @@ async def fetch_remote_session_view(home_base: str, session_id: str) -> Optional
         from urllib.parse import quote
 
         client = AsyncHTTPClient()
+        headers = {"Accept": "application/json"}
+        if rp_token:
+            headers["X-Password-Auth-RP-Token"] = rp_token
         req = HTTPRequest(
             url=f"{base}/password-rotation/auth-session/{quote(session_id, safe='')}",
             method="GET",
-            headers={"Accept": "application/json"},
+            headers=headers,
             connect_timeout=8,
             request_timeout=20,
         )
@@ -315,6 +345,27 @@ async def insert_session(doc: dict) -> None:
 
 async def update_session(session_id: str, fields: dict) -> None:
     await _db()[COLLECTION].update_one({"session_id": session_id}, {"$set": fields})
+
+
+async def claim_session_result(session_id: str) -> Optional[dict]:
+    """Atomically consume an approved result.
+
+    Only the caller that flips ``result_consumed`` receives the pre-claim
+    document (which carries the one-time token/password). Concurrent readers
+    get ``None`` so two browsers can never both receive the same secret.
+    """
+    if not session_id:
+        return None
+    return await _db()[COLLECTION].find_one_and_update(
+        {
+            "session_id": session_id,
+            "status": "approved",
+            "result_consumed": {"$ne": True},
+        },
+        {"$set": {"result_consumed": True}},
+        projection={"_id": 0},
+        return_document=False,
+    )
 
 
 async def list_pending_for_identity(
@@ -1000,6 +1051,50 @@ async def resolve_password_route(username: str, handler=None) -> dict:
     }
 
 
+def pending_auth_message(username: str, timestamp: int) -> str:
+    """Message an authenticator signs to drain its own pending queue."""
+    return f"password-auth-pending|{username}|{int(timestamp)}"
+
+
+def password_auth_presence_message(username: str, timestamp: int) -> str:
+    """Domain-separated message a password app signs to register WS presence."""
+    return f"password-auth-presence|{username}|{int(timestamp)}"
+
+
+_PROOF_SEEN: dict[str, float] = {}
+
+
+def consume_auth_proof(signature_b64: str) -> bool:
+    """Reject a proof signature that was already accepted inside its window.
+
+    Process-local cache. Pending/presence proofs are only valid for
+    PENDING_AUTH_WINDOW_SEC, so entries older than that are pruned.
+    """
+    now = _now()
+    for key, seen_at in list(_PROOF_SEEN.items()):
+        if now - seen_at > PENDING_AUTH_WINDOW_SEC:
+            _PROOF_SEEN.pop(key, None)
+    key = hashlib.sha256((signature_b64 or "").encode("utf-8")).hexdigest()
+    if key in _PROOF_SEEN:
+        return False
+    _PROOF_SEEN[key] = now
+    return True
+
+
+def verify_identity_signature(
+    *, public_key: str, message: str, signature_b64: str
+) -> bool:
+    """Verify a DER signature over sha256(message) with an identity key."""
+    try:
+        import base64
+
+        sig = base64.b64decode((signature_b64 or "").replace(" ", "+"))
+        pub = bytes.fromhex(public_key)
+        return bool(verify_signature(sig, message.encode("utf-8"), pub))
+    except Exception:
+        return False
+
+
 def verify_home_signature(
     *,
     public_key: str,
@@ -1023,6 +1118,14 @@ def verify_home_signature(
 
 def verify_result_token(doc: dict, token: str) -> bool:
     expected = (doc.get("result_token") or "").strip()
+    got = (token or "").strip()
+    if not expected or not got:
+        return False
+    return hmac.compare_digest(expected, got)
+
+
+def verify_rp_token(doc: dict, token: str) -> bool:
+    expected = (doc.get("rp_token") or "").strip()
     got = (token or "").strip()
     if not expected or not got:
         return False
