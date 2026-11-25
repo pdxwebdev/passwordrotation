@@ -1143,12 +1143,32 @@ class PasswordHomeHandler(BaseHandler):
         from plugins.passwordrotation import auth_session as asess
 
         username = (self.get_argument("username", "") or "").strip()
+        username_signature = (self.get_argument("username_signature", "") or "").strip()
         if not username:
             self.set_status(400)
             return self.render_as_json(
                 {"status": False, "message": "username required"}
             )
         route = await asess.resolve_password_route(username, self)
+        if not route.get("status") and username_signature:
+            home = await asess.resolve_password_home_sp_live(
+                username_signature, self
+            )
+            route = {
+                "status": True,
+                "username": username,
+                "username_signature": username_signature,
+                "public_key": "",
+                "node_http_base": home.get("node_http_base"),
+                "source": home.get("source"),
+                "is_local": home.get("is_local"),
+                "sp_username_signature": home.get("sp_username_signature"),
+                "sp_host": home.get("sp_host"),
+                "claimed": False,
+                "deterministic_node_http_base": home.get("node_http_base"),
+                "tried": home.get("tried") or [],
+                "message": home.get("message"),
+            }
         if not route.get("status"):
             self.set_status(404)
             return self.render_as_json(route)
