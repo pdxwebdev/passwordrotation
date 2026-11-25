@@ -1706,6 +1706,10 @@ class MobilePasswordRotationHandler(_PasswordDocHandler):
         self.render("mobile_password_rotation.html")
 
 
+def _passwordrotation_static_path():
+    return os.path.join(os.path.dirname(__file__), "static")
+
+
 def _passwordrotation_mobile_static_path():
     return os.path.join(os.path.dirname(__file__), "static", "mobile")
 
@@ -1743,6 +1747,11 @@ HANDLERS = PASSWORD_ROTATION_HANDLERS = [
     (r"/password-rotation/auth-session", PasswordAuthSessionCreateHandler),
     (r"/password-rotation/home", PasswordHomeHandler),
     (r"/password-rotation/theme\.json", PasswordThemeHandler),
+    (
+        r"/password-rotation/static/(.*)",
+        StaticFileHandler,
+        {"path": _passwordrotation_static_path()},
+    ),
     (r"/password-rotation/mobile", PasswordMobileDemoHandler),
     (
         r"/password-rotation/mobile/(.*)",
