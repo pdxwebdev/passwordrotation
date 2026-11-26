@@ -57,6 +57,21 @@ def _origin_netloc(url: str) -> str:
         return ""
 
 
+def _is_loopback_origin(value: str) -> bool:
+    """True for http(s) origins whose host is localhost/loopback."""
+    from urllib.parse import urlparse
+
+    raw = (value or "").strip()
+    if not raw:
+        return False
+    try:
+        parsed = urlparse(raw if "://" in raw else f"http://{raw}")
+        host = (parsed.hostname or "").lower()
+    except Exception:
+        return False
+    return host in ("localhost", "127.0.0.1", "::1")
+
+
 def is_admin_branch_peer(handler, branch_peer: str) -> bool:
     """True if branch_peer is this node's public origin (scheme optional)."""
     peer = (branch_peer or "").strip().lower().rstrip("/")
@@ -741,6 +756,15 @@ class PasswordAuthSessionCreateHandler(BaseHandler):
             is_local = bool(route.get("is_local")) or asess.is_same_home(
                 home_url, this_base
             )
+            # Local development: a loopback RP page should be served by the
+            # loopback node itself, even when the username's deterministic home
+            # is a remote SP. The browser extension prefers the loopback page
+            # origin, so proxying would send the request to a home the locally
+            # connected password app never sees. A locally created session is
+            # drained by join_password_auth when the app connects here.
+            if _is_loopback_origin(site) and _is_loopback_origin(this_base):
+                home_url = this_base
+                is_local = True
 
         # Proxy to deterministic home SP when this node is not that SP.
         # On proxy failure, fall back to creating the session locally so local
