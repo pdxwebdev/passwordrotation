@@ -387,7 +387,7 @@ async def list_pending_for_identity(
         q["$or"] = or_parts
     else:
         return []
-    cur = _db()[COLLECTION].find(q, {"_id": 0}).sort([("created_at", 1)]).limit(20)
+    cur = _db()[COLLECTION].find(q, {"_id": 0}).sort([("created_at", -1)]).limit(20)
     return await cur.to_list(20)
 
 
